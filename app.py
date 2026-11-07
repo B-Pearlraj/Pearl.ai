@@ -11,6 +11,7 @@ import os
 
 import copy
 import streamlit.components.v1 as components
+import base64
 
 from main import (
     agent,
@@ -2001,9 +2002,11 @@ div[data-testid="stChatInput"] button[data-testid="stChatInputApproveButton"]{
 }
 
 [class*="st-key-ttsplayer_"]{
-  padding-left:40px;
-  margin-top:6px;
-  max-width:480px;
+  height:0 !important;
+  min-height:0 !important;
+  margin:0 !important;
+  padding:0 !important;
+  overflow:hidden !important;
 }
 
 [class*="st-key-ttsplayer_"] audio{
@@ -2534,6 +2537,7 @@ ACTION_ICONS = {
     "share": '<svg viewBox="0 0 24 24"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>',
     "speak": '<svg viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>',
     "stop": '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+    "loading": '<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.55"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></path></svg>',
 }
 
 ACTION_IFRAME_TEMPLATE = r"""<!doctype html>
@@ -2648,14 +2652,36 @@ __BUTTONS__
 
     const synth = W.speechSynthesis;
     let showing = false;
+    let showingWait = false;
+
+    // server voice: the audio is created on the server and played by the
+    // parent page itself (W.__pearlAudio), so no player is ever shown
+    const isLoading = function () {
+      return W.__pearlLoadingId === CFG.id;
+    };
+
+    const serverPlaying = function () {
+      const a = W.__pearlAudio;
+      return !!a && W.__pearlSpeakId === CFG.id && !a.paused && !a.ended;
+    };
+
+    const stopServerVoice = function () {
+      W.__pearlLoadingId = null;
+      try {
+        if (W.__pearlAudio) { W.__pearlAudio.pause(); W.__pearlAudio = null; }
+      } catch (e) { /* ignore */ }
+    };
 
     const isActive = function () {
+      if (isLoading() || serverPlaying()) return true;
       return !!synth && W.__pearlSpeakId === CFG.id && (synth.speaking || synth.pending);
     };
 
     const paint = function (on) {
       showing = on;
-      speakBtn.innerHTML = on ? ICONS.stop : ICONS.speak;
+      const wait = on && isLoading();
+      showingWait = wait;
+      speakBtn.innerHTML = wait ? ICONS.loading : (on ? ICONS.stop : ICONS.speak);
       speakBtn.classList.toggle('on', on);
       speakBtn.title = on ? 'Stop' : CFG.labels.speak;
     };
@@ -2739,10 +2765,12 @@ __BUTTONS__
       speakBtn.onclick = async function () {
         if (isActive()) {
           W.__pearlSpeakId = null;
-          synth.cancel();
+          stopServerVoice();
+          if (synth) synth.cancel();
           paint(false);
           return;
         }
+        stopServerVoice();
         if (synth) synth.cancel();
 
         const lang = detectLang(CFG.speech);
@@ -2752,7 +2780,12 @@ __BUTTONS__
 
         // a non-English message and no matching voice on this device
         if (CFG.server_key && (!lang || !voice)) {
+          W.__pearlSpeakId = CFG.id;
+          W.__pearlLoadingId = CFG.id;
+          paint(true);                      // the speaker icon turns into a spinner
           if (callServerVoice()) return;
+          W.__pearlLoadingId = null;
+          paint(false);
         }
         if (!synth) return;
 
@@ -2771,7 +2804,7 @@ __BUTTONS__
       if (synth) {
         setInterval(function () {
           const active = isActive();
-          if (active !== showing) paint(active);
+          if (active !== showing || (active && isLoading() !== showingWait)) paint(active);
         }, 400);
       }
     }
@@ -3100,6 +3133,53 @@ def branch_conversation(conv, idx):
 #   no Tamil / Telugu / Hindi ... voice installed.
 # ------------------------------------------------------------
 
+def play_audio_script(speak_id, wav):
+    """
+    JavaScript that plays `wav` (bytes) in the main page, so it keeps playing
+    when Streamlit redraws, and lets the speaker icon stop it. With wav=None
+    it only clears the loading state of the icon (voice failed).
+    """
+    data = base64.b64encode(wav).decode("ascii") if wav else ""
+    return """
+(function () {
+  var id = %s, b64 = "%s";
+  var W = window;
+  try { if (window.parent && window.parent.document) W = window.parent; } catch (e) { W = window; }
+
+  // the visitor pressed stop (or another message) while the voice was created
+  if (W.__pearlLoadingId !== id) return;
+
+  function done() { if (W.__pearlLoadingId === id) W.__pearlLoadingId = null; }
+  if (!b64) { W.__pearlSpeakId = null; done(); return; }
+
+  try {
+    var bin = W.atob(b64), n = bin.length, bytes = new W.Uint8Array(n);
+    for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+    var url = W.URL.createObjectURL(new W.Blob([bytes], { type: "audio/wav" }));
+    var audio = new W.Audio(url);
+    audio.onended = function () { W.URL.revokeObjectURL(url); if (W.__pearlSpeakId === id) W.__pearlSpeakId = null; };
+    audio.onerror = function () { W.__pearlSpeakId = null; done(); };
+    if (W.__pearlAudio) { try { W.__pearlAudio.pause(); } catch (e) {} }
+    W.__pearlAudio = audio;
+    audio.play().then(done).catch(function () { W.__pearlSpeakId = null; done(); });
+  } catch (e) { W.__pearlSpeakId = null; done(); }
+})();
+""" % (json.dumps(id_safe(speak_id)), data)
+
+
+def id_safe(value):
+    return str(value)
+
+
+def run_page_script(script):
+    """Run JavaScript in the browser through a zero-size, invisible iframe."""
+    page = "<!doctype html><html><body><script>" + script.replace("</", "<\\/") + "</script></body></html>"
+    if hasattr(st, "iframe"):
+        st.iframe(page, width=1, height=1)
+    else:
+        components.html(page, height=0, width=0)
+
+
 @st.cache_data(ttl=3600, max_entries=12, show_spinner=False)
 def cached_speech(text):
     """(wav bytes, was_shortened); listening again costs nothing."""
@@ -3279,23 +3359,18 @@ def render_assistant_actions(conv_id, conv, idx, msg, is_last):
                             branch_conversation(conv, idx)
                             st.rerun()
 
-    # voice player for the message whose speaker button was pressed
+    # The speaker icon of the message was pressed: create the voice and let
+    # the page play it (no spinner text, no audio player on screen).
     play = st.session_state.get("tts_play")
-    if use_server_voice and play and play.get("uid") == uid:
+    if use_server_voice and play and play.get("uid") == uid and play.get("autoplay"):
+        play["autoplay"] = False       # later reruns must not start the audio again
         with st.container(key=f"ttsplayer_{uid}"):
             try:
-                with st.spinner("Preparing the voice\u2026"):
-                    wav, shortened = cached_speech(strip_markdown_for_speech(msg["content"]))
-                st.audio(wav, format="audio/wav", autoplay=bool(play.get("autoplay")))
-                if shortened:
-                    st.caption("Reading the first part of this reply.")
+                wav, _shortened = cached_speech(strip_markdown_for_speech(msg["content"]))
+                run_page_script(play_audio_script(f"{uid}_a", wav))
             except Exception as exc:
                 print(f"[tts] {exc}")
-                friendly = str(exc) if isinstance(exc, tts_service.TTSError) else (
-                    "The voice could not be created right now. Please try again."
-                )
-                st.caption(friendly)
-        play["autoplay"] = False       # later reruns must not start the audio again
+                run_page_script(play_audio_script(f"{uid}_a", None))
 
 
 def render_edit_box(conv_id, conv, idx, msg):
