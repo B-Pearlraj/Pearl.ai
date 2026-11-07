@@ -2001,6 +2001,14 @@ div[data-testid="stChatInput"] button[data-testid="stChatInputApproveButton"]{
   display:none !important;
 }
 
+[class*="st-key-micguard"]{
+  height:0 !important;
+  min-height:0 !important;
+  margin:0 !important;
+  padding:0 !important;
+  overflow:hidden !important;
+}
+
 [class*="st-key-ttsplayer_"]{
   height:0 !important;
   min-height:0 !important;
@@ -3430,7 +3438,8 @@ def render_message_images(conv_id, idx, msg):
 
     for n, img in enumerate(msg.get("images") or []):
         tag = f"{conv_id[:8]}_{idx}_{msg_tag}_{n}"
-        width = _display_width(img["data"])
+        is_founder = img.get("kind") == "founder"
+        width = _display_width(img["data"], max_w=260, max_h=260) if is_founder else _display_width(img["data"])
 
         if role == "assistant":
             ext = {"image/png": "png", "image/webp": "webp"}.get(img.get("mime"), "jpg")
@@ -3441,6 +3450,8 @@ def render_message_images(conv_id, idx, msg):
                         unsafe_allow_html=True,
                     )
                 st.image(img["data"], width=width)
+                if is_founder:
+                    continue
                 st.download_button(
                     "Download image",
                     data=img["data"],
@@ -4299,6 +4310,64 @@ def build_agent_prompt(prompt):
 # CHAT INPUT  (ChatGPT style: "+" button inside the message box)
 # ============================================================
 
+
+MIC_GUARD_JS = r"""
+(function () {
+  var W = window;
+  try { if (window.parent && window.parent.document) W = window.parent; } catch (e) { W = window; }
+  if (W.__pearlMicGuard) return;
+  W.__pearlMicGuard = true;
+
+  // the code below is evaluated in the main page so it survives Streamlit redraws
+  W.eval('(' + function () {
+    var D = document;
+
+    function toast(msg) {
+      var old = D.getElementById('pearl-mic-toast');
+      if (old) old.remove();
+      var t = D.createElement('div');
+      t.id = 'pearl-mic-toast';
+      t.textContent = msg;
+      t.style.cssText = 'position:fixed;left:50%;bottom:96px;transform:translateX(-50%);' +
+        'max-width:min(560px,90vw);padding:12px 18px;border-radius:12px;z-index:999999;' +
+        'background:#1B2440;color:#E8ECF8;border:1px solid rgba(99,102,241,.55);' +
+        'font:14px/1.45 Inter,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.45);';
+      D.body.appendChild(t);
+      setTimeout(function () { if (t.parentNode) t.remove(); }, 9000);
+    }
+
+    D.addEventListener('click', function (ev) {
+      var btn = ev.target && ev.target.closest &&
+        ev.target.closest('button[data-testid="stChatInputMicButton"]');
+      if (!btn) return;
+
+      if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        toast('The microphone only works on an https:// page or on localhost. ' +
+              'Open the app through its https link (or http://localhost) and try again.');
+        return;
+      }
+
+      // ask for the permission right now and report exactly what is wrong
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+        stream.getTracks().forEach(function (tr) { tr.stop(); });
+      }).catch(function (err) {
+        var n = (err && err.name) || '';
+        if (n === 'NotAllowedError' || n === 'SecurityError') {
+          toast('Microphone is blocked for this site. Click the lock icon in the address bar, ' +
+                'set Microphone to Allow, then reload the page.');
+        } else if (n === 'NotFoundError' || n === 'OverconstrainedError') {
+          toast('No microphone was found. Plug one in or choose one in your system sound settings.');
+        } else if (n === 'NotReadableError') {
+          toast('The microphone is being used by another app. Close it and try again.');
+        } else {
+          toast('The microphone could not be started (' + (n || 'unknown error') + ').');
+        }
+      });
+    }, true);
+  }.toString() + ')()');
+})();
+"""
+
 # Streamlit >= 1.47 can also put a microphone button inside st.chat_input.
 CHAT_AUDIO_SUPPORT = "accept_audio" in inspect.signature(st.chat_input).parameters
 
@@ -4310,6 +4379,10 @@ if CHAT_FILE_SUPPORT:
     )
 if CHAT_AUDIO_SUPPORT:
     _chat_input_options["accept_audio"] = True
+
+if CHAT_AUDIO_SUPPORT:
+    with st.container(key="micguard"):
+        run_page_script(MIC_GUARD_JS)
 
 submission = st.chat_input("Ask anything...", **_chat_input_options)
 
@@ -4360,7 +4433,7 @@ if submission:
 def _last_image(conv):
     """Most recent picture earlier in this chat (for "make it darker")."""
     for m in reversed(conv["messages"][:-1]):
-        imgs = m.get("images") or []
+        imgs = [i for i in (m.get("images") or []) if i.get("kind") != "founder"]
         if imgs:
             return imgs[-1]
     return None
@@ -4434,6 +4507,87 @@ def generate_image_reply(conv, prompt, placeholder, intent, images, previous):
         return friendly_error(exc), True, []
 
 
+# ------------------------------------------------------------
+# "What is your name?" -> Pearl.AI, founded by Muthuraj (with his picture)
+#   Answered by the app itself, so the reply is always the same and the
+#   photo can be shown with it.
+# ------------------------------------------------------------
+
+_FOUNDER_IMAGE_FILES = ("Face-PTS.png", "Un-Background-Face-PTS.png")
+
+_IDENTITY_PATTERNS = [
+    # English
+    r"\b(your|you|ur|yo)\s+(good\s+|full\s+)?name\b",
+    r"\bwhat\s+(should|can|do)\s+i\s+call\s+you\b",
+    r"\bwho\s+(are|r)\s+(you|u)\b",
+    r"\bwho\s+(is|are)\s+(you|this)\b",
+    r"\bwho\s+(made|created|built|developed|designed|trained|owns|invented|programmed)\s+(you|u)\b",
+    r"\bwho\s+is\s+(your|the)\s+(founder|creator|owner|developer|maker|boss)\b",
+    r"\b(founder|creator|owner)\s+of\s+(pearl|this)\b",
+    r"\b(introduce|tell\s+me\s+about)\s+yourself\b",
+    r"\bwhat\s+(are|is)\s+(you|pearl)\b\s*\??$",
+    # Tamil
+    r"(\u0b89\u0ba9\u0bcd|\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bcd|\u0b89\u0ba9\u0bcd\u0ba9\u0bc1\u0b9f\u0bc8\u0baf|\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc1\u0b9f\u0bc8\u0baf)\s*\u0baa\u0bc6\u0baf\u0bb0\u0bcd",
+    r"(\u0ba8\u0bc0|\u0ba8\u0bc0\u0b99\u0bcd\u0b95\u0bb3\u0bcd)\s*\u0baf\u0bbe\u0bb0\u0bcd",
+    r"(\u0b89\u0ba9\u0bcd\u0ba9\u0bc8|\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc8)\s*\u0baf\u0bbe\u0bb0\u0bcd",
+    r"\u0ba8\u0bbf\u0bb1\u0bc1\u0bb5\u0ba9\u0bb0\u0bcd",
+    # Hindi
+    r"(\u0924\u0941\u092e\u094d\u0939\u093e\u0930\u093e|\u0906\u092a\u0915\u093e|\u0924\u0947\u0930\u093e)\s*\u0928\u093e\u092e",
+    r"(\u0924\u0941\u092e|\u0906\u092a)\s*\u0915\u094c\u0928",
+]
+_IDENTITY_RE = [re.compile(p, re.IGNORECASE) for p in _IDENTITY_PATTERNS]
+
+_IDENTITY_REPLIES = {
+    "ta": (
+        "\u0b8e\u0ba9\u0bcd \u0baa\u0bc6\u0baf\u0bb0\u0bcd **Pearl.AI**. "
+        "\u0b8e\u0ba9\u0bcd\u0ba9\u0bc8 Pearl.AI-\u0baf\u0bbf\u0ba9\u0bcd \u0ba8\u0bbf\u0bb1\u0bc1\u0bb5\u0ba9\u0bb0\u0bcd "
+        "**\u0bae\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0bb0\u0bbe\u0b9c\u0bcd (Muthuraj)** "
+        "\u0b89\u0bb0\u0bc1\u0bb5\u0bbe\u0b95\u0bcd\u0b95\u0bbf\u0ba9\u0bbe\u0bb0\u0bcd. "
+        "\u0ba8\u0bbe\u0ba9\u0bcd \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc1\u0b95\u0bcd\u0b95\u0bc1 "
+        "\u0b8e\u0baa\u0bcd\u0baa\u0b9f\u0bbf \u0b89\u0ba4\u0bb5\u0bb2\u0bbe\u0bae\u0bcd?"
+    ),
+    "hi": (
+        "\u092e\u0947\u0930\u093e \u0928\u093e\u092e **Pearl.AI** \u0939\u0948\u0964 "
+        "\u092e\u0941\u091d\u0947 Pearl.AI \u0915\u0947 \u0938\u0902\u0938\u094d\u0925\u093e\u092a\u0915 "
+        "**Muthuraj** \u0928\u0947 \u092c\u0928\u093e\u092f\u093e \u0939\u0948\u0964 "
+        "\u092e\u0948\u0902 \u0906\u092a\u0915\u0940 \u0915\u0948\u0938\u0947 \u092e\u0926\u0926 "
+        "\u0915\u0930 \u0938\u0915\u0924\u093e \u0939\u0942\u0901?"
+    ),
+    "en": (
+        "My name is **Pearl.AI**. I was created by **Muthuraj**, the founder of "
+        "Pearl.AI. How can I help you today?"
+    ),
+}
+
+
+def identity_language(text):
+    if re.search(r"[\u0B80-\u0BFF]", text or ""):
+        return "ta"
+    if re.search(r"[\u0900-\u097F]", text or ""):
+        return "hi"
+    return "en"
+
+
+def is_identity_question(text):
+    """Short messages asking Pearl's name / maker / founder."""
+    t = (text or "").strip().lower()
+    if not t or len(t.split()) > 8:
+        return False
+    return any(rx.search(t) for rx in _IDENTITY_RE)
+
+
+@st.cache_resource(show_spinner=False)
+def founder_image():
+    """The founder's picture as an image dict (None when the file is missing)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in _FOUNDER_IMAGE_FILES:
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            with open(path, "rb") as fh:
+                return {"id": None, "mime": "image/png", "data": fh.read(), "kind": "founder"}
+    return None
+
+
 def generate_reply(conv, prompt, placeholder, images=None):
     """Answer the last user message into `placeholder`.
 
@@ -4446,6 +4600,17 @@ def generate_reply(conv, prompt, placeholder, images=None):
     must be the user's message that is being answered.
     """
     images = list(images or [])
+
+    # "What is your name?" / "Who made you?" -> Pearl.AI by Muthuraj + his picture
+    if not images and is_identity_question(prompt):
+        reset_thread(conv)   # the agent's memory does not contain this turn
+        photo = founder_image()
+        return (
+            _IDENTITY_REPLIES[identity_language(prompt)],
+            False,
+            [photo] if photo else [],
+        )
+
     previous = None if images else _last_image(conv)
 
     intent = image_service.detect_intent(prompt, bool(images), previous is not None)
