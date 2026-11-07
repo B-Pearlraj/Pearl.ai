@@ -165,6 +165,15 @@ def markdown_to_html(text: str) -> str:
     # ---- Inline code: `code` ----
     safe = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", safe)
 
+    # ---- Links: [text](https://...)  (only http / https) ----
+    link_items = []
+
+    def _stash_link(match):
+        link_items.append((match.group(1), match.group(2)))
+        return f"@@PEARLLINK{len(link_items) - 1}@@"
+
+    safe = re.sub(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)", _stash_link, safe)
+
     # ---- Bold: **text** or __text__ ----
     safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
     safe = re.sub(r"__(.+?)__", r"<strong>\1</strong>", safe)
@@ -249,6 +258,14 @@ def markdown_to_html(text: str) -> str:
     flush_paragraph()
 
     result = "".join(html_parts) if html_parts else f"<p>{safe}</p>"
+
+    # ---- Restore links (they open in a new tab) ----
+    for idx, (label, url) in enumerate(link_items):
+        label_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", label)
+        result = result.replace(
+            f"@@PEARLLINK{idx}@@",
+            f'<a href="{url}" target="_blank" rel="noopener noreferrer">{label_html}</a>',
+        )
 
     # ---- Restore fenced code blocks ----
     for idx, code in enumerate(code_blocks):
@@ -1291,6 +1308,26 @@ input[type="text"]:focus{
 .pearl-bubble p:last-child{
 
   margin-bottom:0;
+
+}
+
+
+.pearl-bubble a{
+
+  color:#A5B4FC;
+
+  text-decoration:underline;
+
+  text-underline-offset:3px;
+
+  cursor:pointer;
+
+}
+
+
+.pearl-bubble a:hover{
+
+  color:#C7D2FE;
 
 }
 
@@ -4514,6 +4551,7 @@ def generate_image_reply(conv, prompt, placeholder, intent, images, previous):
 # ------------------------------------------------------------
 
 _FOUNDER_IMAGE_FILES = ("Face-PTS.png", "Un-Background-Face-PTS.png")
+FOUNDER_URL = "https://pearltechlab.onrender.com"   # opens when "Muthuraj" is clicked
 
 _IDENTITY_PATTERNS = [
     # English
@@ -4541,7 +4579,7 @@ _IDENTITY_REPLIES = {
     "ta": (
         "\u0b8e\u0ba9\u0bcd \u0baa\u0bc6\u0baf\u0bb0\u0bcd **Pearl.AI**. "
         "\u0b8e\u0ba9\u0bcd\u0ba9\u0bc8 Pearl.AI-\u0baf\u0bbf\u0ba9\u0bcd \u0ba8\u0bbf\u0bb1\u0bc1\u0bb5\u0ba9\u0bb0\u0bcd "
-        "**\u0bae\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0bb0\u0bbe\u0b9c\u0bcd (Muthuraj)** "
+        "[**\u0bae\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0bb0\u0bbe\u0b9c\u0bcd (Muthuraj)**](" + FOUNDER_URL + ") "
         "\u0b89\u0bb0\u0bc1\u0bb5\u0bbe\u0b95\u0bcd\u0b95\u0bbf\u0ba9\u0bbe\u0bb0\u0bcd. "
         "\u0ba8\u0bbe\u0ba9\u0bcd \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bc1\u0b95\u0bcd\u0b95\u0bc1 "
         "\u0b8e\u0baa\u0bcd\u0baa\u0b9f\u0bbf \u0b89\u0ba4\u0bb5\u0bb2\u0bbe\u0bae\u0bcd?"
@@ -4549,12 +4587,12 @@ _IDENTITY_REPLIES = {
     "hi": (
         "\u092e\u0947\u0930\u093e \u0928\u093e\u092e **Pearl.AI** \u0939\u0948\u0964 "
         "\u092e\u0941\u091d\u0947 Pearl.AI \u0915\u0947 \u0938\u0902\u0938\u094d\u0925\u093e\u092a\u0915 "
-        "**Muthuraj** \u0928\u0947 \u092c\u0928\u093e\u092f\u093e \u0939\u0948\u0964 "
+        "[**Muthuraj**](" + FOUNDER_URL + ") \u0928\u0947 \u092c\u0928\u093e\u092f\u093e \u0939\u0948\u0964 "
         "\u092e\u0948\u0902 \u0906\u092a\u0915\u0940 \u0915\u0948\u0938\u0947 \u092e\u0926\u0926 "
         "\u0915\u0930 \u0938\u0915\u0924\u093e \u0939\u0942\u0901?"
     ),
     "en": (
-        "My name is **Pearl.AI**. I was created by **Muthuraj**, the founder of "
+        "My name is **Pearl.AI**. I was created by [**Muthuraj**](" + FOUNDER_URL + "), the founder of "
         "Pearl.AI. How can I help you today?"
     ),
 }
